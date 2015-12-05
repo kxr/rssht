@@ -1,0 +1,251 @@
+#!/bin/bash
+# Script: rssht (Reverse SSH Tunnel)
+# Author: Khizer Naeem (khizernaeem(x)gmail.com)
+# Created : 09 Sep 2012
+# Version: 1.0
+# Latest Revision: 09 Sep 2012
+# Tested on: Centos/RHEL 6, Centos/RHEL 5,  
+# Description:	A bash script to maintain reverse ssh tunnel with remote port forwardings.
+#
+# Copyright (C) 2012 Khizer Naeem All rights reserved.
+# This copyrighted material is made available to anyone wishing to use,
+# modify, copy, or redistribute it subject to the terms and conditions
+# of the GNU General Public License v.2.
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software Foundation,
+# Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+
+#############################
+## CONFIGURATION VARIABLES ##
+#############################
+
+REMOTE_HOST=						# The remote host to which you want to forward the ports
+REMOTE_SSH_PORT=				# SSH port of the remote host
+REMOTE_USER=				# SSH user for the remote host (Should have password less login from this machine with this user)
+SSH_RUN_DIR=/var/run/rev_ssh/		# Directory to keep ssh socket connection and pid file (Should exist)
+PORTS_REMOTELY_ACCESSIBLE=yes		# If set to yes, -g switch will be used while making the ssh connection. Read ssh manual for detail of -g
+SSH_BIN=/usr/bin/ssh				# Location of the ssh client on this host
+REFRESH_SOCKET=0					# If set to a non-zero integer, this script will restart the ssh session if its that many minutes old.
+
+###########################
+## PORT FORWARDING TABLE ##
+###########################
+
+# SOURCE_PORT[N] on the SOURCE_HOST[N] host will be forwarded to the remote host as DESTINATION_PORT[N]
+SOURCE_HOST[1]='localhost'		;	SOURCE_PORT[1]='22'			;	DESTINATION_PORT[1]='58531'
+SOURCE_HOST[2]='localhost'		;	SOURCE_PORT[2]='5900'		;	DESTINATION_PORT[2]='58532'
+SOURCE_HOST[3]='localhost'		;	SOURCE_PORT[3]='80'			;	DESTINATION_PORT[3]='58533'
+SOURCE_HOST[4]='localhost'		;	SOURCE_PORT[4]='3306'		;	DESTINATION_PORT[4]='58534'
+# SOURCE_HOST[5]='localhost'	;	SOURCE_PORT[5]=''			;	DESTINATION_PORT[5]=''
+# SOURCE_HOST[x]='localhost'	;	SOURCE_PORT[x]=''			;	DESTINATION_PORT[x]=''
+
+#######################
+## SSH OPTIONS TABLE ##
+#######################
+
+# These options will be passed to ssh with the -o switch e.g -o "ControlMaster yes"
+# You can comment out all of these if you want the script to obey the ssh config
+SSH_OPTION_NAME[1]='ControlMaster'				;	SSH_OPTION_VALUE[1]='yes'
+#SSH_OPTION_NAME[2]='ConnectionAttempts'			;	SSH_OPTION_VALUE[2]='3'
+#SSH_OPTION_NAME[3]='ConnectTimeout'				;	SSH_OPTION_VALUE[3]='20'
+SSH_OPTION_NAME[4]='PreferredAuthentications'	;	SSH_OPTION_VALUE[4]='publickey'		# Make this 'publickey,password' if you want to enter passowrd
+SSH_OPTION_NAME[5]='Ciphers'					;	SSH_OPTION_VALUE[5]='arcfour256'
+SSH_OPTION_NAME[6]='Compression'				;	SSH_OPTION_VALUE[6]='yes'
+SSH_OPTION_NAME[7]='ServerAliveCountMax'		;	SSH_OPTION_VALUE[7]='3'				# These 2 options are set to make sure that ssh disconnects from the
+SSH_OPTION_NAME[8]='ServerAliveInterval'		;	SSH_OPTION_VALUE[8]='10'			# server if the connection is stalled. In this case after 3x10=30sec
+
+
+#			/////////////////////////
+#			// Do not modify below //
+#			/////////////////////////
+
+#########################
+## SCRIPT INSTALLATION ##
+#########################
+
+if [ "$1" == "install" -o "$1" == "--help" -o "$1" == "-h" ]
+then
+	echo "INSTALLATION INSTRUCTIONS:"
+	echo
+	echo "# Make the RUN Directory"
+	echo "mkdir -p $SSH_RUN_DIR"
+	echo
+	echo "# Make sure you have ssh keys generated"
+	echo "ssh-keygen"
+	echo
+	echo "# Setup password-less login to the remote host"
+	echo "ssh-copy-id '$REMOTE_HOST -l $REMOTE_USER -p $REMOTE_SSH_PORT'"
+	echo
+	echo "# Set the configuration variables and forwarding ports values"
+	echo
+	echo "# Run the script with test as first argument to see if every thing is fine"
+	echo "sh $0 test"
+	echo
+	echo "# Add the cron job"
+	echo "echo '*/5 * * * * root $( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )/rsst' > /etc/cron.d/rsst"
+	exit 0
+fi
+
+if [ "$1" == "test" ]
+then
+	all_good="yes"
+	# RUN Directory check
+	echo
+	echo -n "RUN directory exits? .. "
+	if [ -d "$SSH_RUN_DIR" ]
+	then
+		echo "yes"
+		echo -n "RUN directory writeable? .. "
+		if [ -w "$SSH_RUN_DIR" ]
+		then
+			echo "yes"
+		else
+			all_good="no"
+			echo "NO!! (fix this by running:"
+			echo "chmod 700 $SSH_RUN_DIR)"
+		fi
+	else
+		all_good="no"
+		echo "NO!! Create directory by running:"
+		echo "mkdir -p $SSH_RUN_DIR"
+	fi
+
+	# SSH Password less login
+	echo
+	echo -n "Can ssh to the remote machine without passowrd? .. "
+	if ($SSH_BIN -o "PreferredAuthentications publickey" -q -l $REMOTE_USER -p $REMOTE_SSH_PORT $REMOTE_HOST "exit")
+	then
+		echo "yes"
+	else
+		echo "NO!! Setup password less login by running:"
+		echo "ssh-copy-id '$REMOTE_HOST -l $REMOTE_USER -p $REMOTE_SSH_PORT'"
+	fi
+
+	if [ "$all_good" == "yes" ]
+	then
+		echo
+		echo "-------------------------------"
+		echo "Every thing seems to be fine :)"
+		exit 0
+	else
+		echo 
+		echo "------------------------------------------------------"
+		echo "Fix the mentioned problem(s) before you run the script"
+		exit 8
+	fi
+
+fi
+
+###############################
+## SSH CONNECTION EVALUATION ##
+###############################
+
+#	If socket exists:
+# 		1-If the socket is old kill the connection (so that a new one is created)
+# 		2-Run the check command on the socket
+#		 	2.1- if it passes, do nothing, exit
+# 			2.2- if it fails kill ssh and remove socket file
+
+# Socket file
+SOCK_FILE="$SSH_RUN_DIR/$REMOTE_HOST.sock"
+# PID file
+PID_FILE="$SSH_RUN_DIR/ssh_$REMOTE_HOST.pid"
+
+if [ -S "$SOCK_FILE" ]
+then
+	# If Socket is older than {REFRESH_SOCKET} minutes, restart the connection
+	if [ "$REFRESH_SOCKET" -gt "0" ]
+	then
+		if [ $(find $SOCK_FILE -mmin +$REFRESH_SOCKET) ]
+		then
+			echo "Existing SSH connection is old, killing"
+			# Send the exit command to the existing socket
+			ssh -O exit -S $SOCK_FILE $REMOTE_HOST &> /dev/null
+			# Kill the pid if the process some how still exists
+			if (kill -0 $(cat $PID_FILE) &> /dev/null )
+			then
+				echo "killing ssh process $(cat $PID_FILE)"
+				kill -9 $(cat $PID_FILE) &> /dev/null
+			fi
+			rm -rf $PID_FILE &> /dev/null
+		fi
+	fi
+	# Check the status of the SSH connection through the socket file
+	if (ssh -O check -S $SOCK_FILE $REMOTE_HOST &> /dev/null)
+	then
+		# SSH connection is fine
+		echo "ssh connection is fine, exiting"
+		exit 0
+	else
+		# SSH socket check failed
+		# Try killing the PID first
+		if [ -e "$PID_FILE" ]
+		then
+			if (kill -0 $(cat $PID_FILE) &> /dev/null )
+			then
+				echo "killing ssh process $(cat $PID_FILE)"
+				kill -9 $(cat $PID_FILE) &> /dev/null
+				rm -rf $PID_FILE &> /dev/null
+			fi
+		fi
+		# Remove the socket
+		if (rm -rf "$SOCK_FILE" &> /dev/null)
+		then
+			echo "FATAL ERROR: Cannot remove stalled socket file $SOCK_FILE"
+			echo "Exiting.."
+			exit 9
+		else
+			echo "Stalled socket file removed"
+		fi
+	fi
+fi
+
+##########################
+## SSH COMMAND CREATION ##
+##########################
+
+# Whether to use -g switch or not
+P_R_A=""
+[ "$PORTS_REMOTELY_ACCESSIBLE" == "yes" ] && P_R_A="-g"
+
+# Remote forwardings
+FWDS=""
+for i in "${!DESTINATION_PORT[@]}"
+do
+	if [ -n "${DESTINATION_PORT[$i]}" -a -n "${SOURCE_HOST[$i]}" -a -n "${SOURCE_PORT[$i]}" ]
+	then
+		FWDS="$FWDS-R ${DESTINATION_PORT[$i]}:${SOURCE_HOST[$i]}:${SOURCE_PORT[$i]} "
+	fi
+done
+
+# SSH options
+SOPTS=""
+for i in "${!SSH_OPTION_NAME[@]}"
+do
+	if [ -n "${SSH_OPTION_NAME[$i]}" -a -n "${SSH_OPTION_VALUE[$i]}" ]
+	then
+		SOPTS="$SOPTS-o '${SSH_OPTION_NAME[$i]} ${SSH_OPTION_VALUE[$i]}' "
+	fi
+done
+
+# SSH final command
+SSH_COMMAND="$SSH_BIN $SOPTS $P_R_A -f -q -N -S $SOCK_FILE $FWDS -p $REMOTE_SSH_PORT -l $REMOTE_USER $REMOTE_HOST"
+
+#####################
+## RUN SSH COMMAND ##
+#####################
+
+eval "$SSH_COMMAND"
+	if [ "$?" -ne "0" ]
+	then
+		echo "FATAL ERROR: SSH command failed"
+		echo "SSH_COMMAND=$SSH_COMMAND"
+		exit 10
+	else
+	#Save the PID
+		SOCK_CHECK=$(ssh -O check -S $SOCK_FILE $REMOTE_HOST 2>&1)
+		SPID=$(echo $SOCK_CHECK | cut -d'=' -f2 | sed 's/)//')
+		echo "$SPID" > $PID_FILE
+		echo "RSSHT started successfully ssh pid: $SPID"
+		exit 0
+	fi
